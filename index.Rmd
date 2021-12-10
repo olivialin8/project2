@@ -1,0 +1,362 @@
+---
+title: 'Project 2: Data Mining, Classification, Prediction'
+author: "SDS322E"
+date: ''
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document:
+    toc: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, fig.align = "center", warning = F, message = F,
+tidy=TRUE, tidy.opts=list(width.cutoff=60), R.options=list(max.print=100))
+
+class_diag <- function(score, truth, positive, cutoff=.5){
+
+  pred <- factor(score>cutoff,levels=c("TRUE","FALSE"))
+  truth <- factor(truth==positive, levels=c("TRUE","FALSE"))
+
+  tab<-table(truth, pred)
+  acc=sum(diag(tab))/sum(tab)
+  sens=tab[1,1]/rowSums(tab)[1]
+  spec=tab[2,2]/rowSums(tab)[2]
+  ppv=tab[1,1]/colSums(tab)[1]
+
+#CALCULATE F1
+  f1=2*(sens*ppv)/(sens+ppv)
+  
+#CALCULATE EXACT AUC
+  truth<-as.numeric(truth=="TRUE")
+  ord<-order(score, decreasing=TRUE)
+  score <- score[ord]; truth <- truth[ord]
+  TPR=cumsum(truth)/max(1,sum(truth))
+  FPR=cumsum(!truth)/max(1,sum(!truth))
+  dup<-c(score[-1]>=score[-length(score)], FALSE)
+  TPR<-c(0,TPR[!dup],1); FPR<-c(0,FPR[!dup],1)
+  n <- length(TPR)
+  auc<- sum( ((TPR[-1]+TPR[-n])/2) * (FPR[-1]-FPR[-n]) )
+  round(data.frame(acc,sens,spec,ppv,f1,ba=(sens+spec)/2,auc, row.names = "Metrics"),4)
+}
+```
+
+# Mining, Classification, Prediction
+
+## Olivia Lin oyl63
+
+### Introduction 
+
+I used the same datasets as before:
+
+I chose 4 datasets: box, on_ice, gar, and xgar. All four datasets contain individual NHL player stats during the 2020-2021 NHL regular season, and were downloaded as CSVs from Evolving-Hockey, a site to which I have a membership. "box" and "on ice" contain data that is scraped from the NHL play by play data as well as some data calculated by a model built by Evolving Hockey. "gar" and "xgar" contain data that is fully calculated by the aforementioned model. 
+
+"box" contains basic box score data for each player at 5v5, such as games played (GP), time on ice (TOI), goals (G), primary assists (A1), secondary assists (A2), and Points. The following columns contain more granular data such as individual shots for (iSF), individual expected goals (ixG), giveaways (GIVE), takeaways (TAKE), etc. "on_ice" has data for the events that occur when a player is on the ice, such as corsi (shot attempts) for and against, as well as the rate they occurred at (calculated as number per 60 minutes played). "gar" stands for Goals Above Replacement, which comes from a regression model built by Evolving Hockey that attempts to isolate the individual player impact on the game by calculating the value of a players contributions in different aspects of the game in terms of goals above replacement level (which is 0), a concept derived from baseball's WAR (wins above replacement). The columns include numbers like "EVO_GAR", which means the goals above replacement by a player at even strength offense, "EVD_GAR" -- GAR at even strength defense, total goals above replacement (GAR), wins above replacement (WAR), and standings points above replacement (SPAR), etc. "xgar" is the same, but calculates the expected goals above replacement rather than the actual GAR. 
+
+This data is interesting to me because it looks beyond just "points" when it comes to measuring a player's impact on the game. It will be a unique perspective to look at players who at first glance at the scoresheet may seem unimpactful because of the lack of points, but are actually contributing in other ways, such as defensively. I believe that the top scorers in the league will have a high number of points and a high EVO_GAR, but it may be surprising to see some of the MVP candidates to be lacking in other areas such as defense and CF%. 
+
+```{R}
+library(tidyverse)
+box <- read_csv("/Users/olivia/Downloads/EH_std_sk_stats_5v5_regular_no_adj_2021-12-10.csv")
+on_ice <- read_csv("/Users/olivia/Downloads/EH_std_sk_stats_5v5_regular_adj_2021-12-10.csv")
+gar <- read_csv("/Users/olivia/Downloads/EH_gar_sk_stats_regular_2021-12-10.csv")
+xgar <- read_csv("/Users/olivia/Downloads/EH_xgar_sk_stats_regular_2021-12-10.csv")
+head(gar)
+
+# tidying
+full_data <- inner_join(box, on_ice, by=c("Player","Team")) %>% inner_join(gar, by=c("Player","Team")) %>% inner_join(xgar, by=c("Player","Team"))
+
+clean_data <- full_data %>% filter(TOI.x > 200) %>% select(-c(Season.y, Position.y, GP.y, Season.x.x, Position.x.x, GP.x.x, TOI_All.x, Season.y.y, Position.y.y, GP.y.y, TOI_All.y, Take_GAR.y, Draw_GAR.y, Pens_GAR.y)) %>% rename(Season = Season.x,
+            Position = Position.x,
+            GP = GP.x,
+            "TOI_All" = TOI.x,
+            "iSh%" = "Sh%.x",
+            "TOI_5V5" = TOI.y,
+            "Sh%" = "Sh%.y",
+            Draw_GAR = Draw_GAR.x,
+            Take_GAR = Take_GAR.x,
+            Pens_GAR = Pens_GAR.x)
+
+head(clean_data)
+
+clean_data <- clean_data %>% mutate("G/60" = G/(TOI_All/60),
+                      "A1/60" = A1/(TOI_All/60),
+                      "A2/60" = A2/(TOI_All/60),
+                      "Points/60" = Points/(TOI_All/60),
+                      "primary_points" = G+A1,
+                      "primary_points/60" = (G+A1)/(TOI_All/60))
+
+# creating binary variable
+clean_data <- clean_data %>% mutate(Forward = ifelse(Position == 'D', 0, 1))
+head(clean_data)
+```
+
+After loading the data, I cleaned the data by filtering out all players who played less than 200 minutes total as that is not a sufficient sample size to calculate rate stats, removing repeat columns from joins, and renaming columns to be more clear. I then added a column using mutate to create a binary variable to indicate whether a player was a forward (1) or a defenseman (0).
+
+```{r}
+nrow(clean_data)
+clean_data %>% group_by(Position) %>% summarize(n = n())
+clean_data %>% group_by(Forward) %>% summarize(n = n())
+clean_data %>% summarize(n_distinct(Player))
+```
+
+There are 422 total observations in the clean dataset. All the observations are distinct after the data was cleaned and duplicates removed.
+When grouping by position of players who played over 200 minutes at 5v5, there are 151 centers, 143 defensemen, 70 left wingers, and 58 right wingers. 
+When grouping by the binary variable "Forward", there are 143 defensemen, and 279 forwards.
+
+### Cluster Analysis
+
+```{R}
+library(cluster)
+
+pam_data_points <- clean_data %>% select(c(G/60,Points/60,primary_points/60,GAR,xGAR))
+head(pam_data_points)
+
+sil_width<-vector() #empty vector to hold mean sil width
+for(i in 2:10){  
+  kms <- kmeans(pam_data_points,centers=i) #compute k-means solution for each k
+  sil <- silhouette(kms$cluster,dist(pam_data_points)) #get sil widths
+  sil_width[i]<-mean(sil[,3]) #take averages (higher is better)
+}
+ggplot()+geom_line(aes(x=1:10,y=sil_width))+scale_x_continuous(name="k",breaks=1:10)
+```
+```{r}
+set.seed(322)
+hockey_pam <- pam_data_points %>% pam(k=2)
+hockey_pam
+```
+```{r}
+plot(hockey_pam,which=2)
+```
+
+
+
+```{r}
+pamclust<-pam_data_points %>% mutate(cluster=as.factor(hockey_pam$clustering))
+#G/60,Points/60,primary_points/60,GAR,xGAR
+
+#G/60 vs Points/60
+pamclust %>% ggplot(aes(G/60,Points/60,color=cluster)) + geom_point() + scale_x_continuous()
+
+#G/60 vs primary_points/60
+pamclust %>% ggplot(aes(G/60,primary_points/60,color=cluster)) + geom_point() + scale_x_continuous()
+
+#G/60 vs GAR
+pamclust %>% ggplot(aes(G/60,GAR,color=cluster)) + geom_point() + scale_x_continuous()
+
+#G/60 vs xGAR
+pamclust %>% ggplot(aes(G/60,xGAR,color=cluster)) + geom_point() + scale_x_continuous()
+
+#Points/60 vs primary_points/60
+pamclust %>% ggplot(aes(Points/60,primary_points/60,color=cluster)) + geom_point() + scale_x_continuous()
+
+#Points/60 vs GAR
+pamclust %>% ggplot(aes(Points/60,GAR,color=cluster)) + geom_point() + scale_x_continuous()
+
+#Points/60 vs xGAR
+pamclust %>% ggplot(aes(Points/60,xGAR,color=cluster)) + geom_point() + scale_x_continuous()
+
+#primary_points/60 vs GAR
+pamclust %>% ggplot(aes(primary_points/60,GAR,color=cluster)) + geom_point() + scale_x_continuous() + scale_y_continuous(breaks=seq(0,30,by=5))
+
+#primary_points/60 vs xGAR
+pamclust %>% ggplot(aes(primary_points/60,xGAR,color=cluster)) + geom_point() + scale_x_continuous()
+
+#GAR vs xGAR
+pamclust %>% ggplot(aes(GAR,xGAR,color=cluster)) + geom_point() + scale_x_continuous()
+```
+
+```{r}
+clean_data%>%slice(hockey_pam$id.med)
+```
+```{r}
+pamclust%>%mutate(position=clean_data$Forward)%>%ggplot(aes(primary_points/60,GAR, color=position, shape=cluster))+geom_point()
+```
+
+There were way too many numeric variables to use all of them in the clustering activity, so I chose the following from the original dataset: G/60, Points/60, primary_points/60, GAR, xGAR. Then, I examined average silhouette width and determined that 2 was the optimal number of clusters. I determined average silhouette width, which came out to be about 0.47. I then visualized the clusters by showing all pairwise combinations of clusters and coloring them by cluster. After that, I sliced the original dataset to find the final mediods who were most representative of their cluster, which were Nathan Bastian and Bo Horvat. Finally, I plotted the primary points/60 vs GAR and colored based on position (1 is a forward, 0 is a defenseman), and used shape for the cluster. 
+
+The average silhouette width of 0.47 falls into the "the structure is weak and could be artificial" group. When visualizing the clusters, it seemed as if in almost all the pairs, the points overall seemed to center around the same line. One cluster consisted of mostly points on the bottom half of the trend line, while the other cluster contained points mostly on the upper half of the trend line. The pair with the most distinct separation of the clusters were (visually) the ones involving any sort of points (Points/60 vs Goals/60, or primary_points/60 and points/60). This makes sense as those who tend to score more goals or points would probably be skilled enough to have a larger portion of them be primary points, etc. What is interesting is that in the pair primary points/60 vs GAR, players in the cluster what tended to have more primary points/60 tended also to have higher GAR. This distinction can be seen when compared to points/60 vs GAR, where the clusters seemed to be more characterized by points/60, but not GAR. 
+
+When looking at the plot of primary points/60 vs GAR colored by position and shapes corresponding to cluster, it seems as if most defensemen fall into the first cluster, tending to have lower primary points/60 and relatively lower GAR. Most forwards are in cluster 2, with all the players with the most primary points/60 being forwards in cluster 2. 
+    
+    
+### Dimensionality Reduction with PCA
+
+```{R}
+pca_data <- clean_data %>% select(c(EVD_GAR,PPO_GAR,SHD_GAR,Take_GAR,Draw_GAR,Off_GAR,Def_GAR,Pens_GAR))
+
+pca_data_nums<- pca_data %>% scale
+
+rownames(pca_data_nums)<-clean_data$Player
+head(pca_data_nums)
+
+gar_pca <-princomp(pca_data_nums, corr=T)
+summary(gar_pca, loadings=T)
+```
+
+
+```{r}
+#scree plot
+eigval<-gar_pca$sdev^2 #square to convert SDs to eigenvalues
+varprop=round(eigval/sum(eigval), 2) #proportion of var explained by each PC
+ggplot() + geom_bar(aes(y=varprop, x=1:8), stat="identity") + xlab("") +
+  geom_text(aes(x=1:8, y=varprop, label=round(varprop, 2)), vjust=1, col="white", size=5) +
+  scale_y_continuous(breaks=seq(0, .6, .2), labels = scales::percent) + 
+  scale_x_continuous(breaks=1:10)
+```
+```{r}
+round(cumsum(eigval)/sum(eigval), 2)
+```
+PC1, PC2, PC3, PC4 account for 83% of the total variance, so I will keep PC1 - PC4.
+
+```{r}
+#scores in dataframe
+hockeypcadf<-data.frame(Player=clean_data$Player, PC1=gar_pca$scores[, 1],PC2=gar_pca$scores[, 2], PC3=gar_pca$scores[, 3], PC4=gar_pca$scores[, 4])
+
+#PC1 and PC2
+ggplot(hockeypcadf, aes(PC1, PC2)) + geom_point()
+
+#PC1 and PC3
+ggplot(hockeypcadf, aes(PC1, PC3)) + geom_point()
+
+#PC1 and PC4
+ggplot(hockeypcadf, aes(PC1, PC4)) + geom_point()
+
+#PC2 and PC3
+ggplot(hockeypcadf, aes(PC2, PC3)) + geom_point()
+
+#PC2 and PC4
+ggplot(hockeypcadf, aes(PC2, PC4)) + geom_point()
+
+#PC3 and PC4
+ggplot(hockeypcadf, aes(PC3, PC4)) + geom_point()
+```
+```{r}
+cor(gar_pca$scores) %>% round(10)
+```
+
+
+I chose to retain PC1, PC2, PC3, and PC4 because they accounted for >80% of the total variance. PC2 is actually the general ability axis because all the loadings have the same sign. The higher a player scores on PC2, the better they are overall in terms of GAR (the variables are the components that make up GAR). PC1 is a defensive axis: EVD/SHD/Def vs. PPO/Take/Draw/Off/Pens. EVD/SHD/Def are even strength defense, short handed defense, and defense overall, so the higher the person scores on this axis the better their defensive abilities (positive signs) and the worse their other abilities (negative signs). PC3 mostly an offensive axis: PPO/Off have the highest magnitudes and positive signs (and EVD and Def with much smaller magnitudes). This means a player who scores well on PC3 is better at offensive components like powerplay offense (PPO) and Offense (Off), but worse at takeaways (take), faceoffs (draw), and penalty differentials (pens). PC4 is EVD/Take vs. SHD/Draw. Those who score highly in PC4 are better at EVD and takeaways, and worse at shorthanded defense and faceoffs. 
+
+There appears to be no correlation between the components, which I determined using the correlation matrix and using the visual plots of the PC's against each other.
+
+###  Linear Classifier
+
+```{R}
+num_data <- clean_data%>%select(-c(Player,Season,Team,Position))
+head(num_data)
+
+#picked 11 variables because I have a lot of numeric ones
+fit <- glm(Forward ~ G + Points + EVO_GAR + EVD_GAR + SHD_GAR + Take_GAR + Draw_GAR + Off_GAR + Def_GAR + Pens_GAR + GAR, data=num_data, family="binomial")
+
+score <- predict(fit, type="response")
+
+class_diag(score,num_data$Forward,positive=1)
+```
+
+```{R}
+set.seed(1234)
+k=10 #choose number of folds
+data<-num_data[sample(nrow(num_data)),] #randomly order rows
+folds<-cut(seq(1:nrow(num_data)),breaks=k,labels=F) #create 10 folds
+diags<-NULL
+for(i in 1:k){
+  ## Create training and test sets
+  train<-data[folds!=i,] 
+  test<-data[folds==i,]
+  truth<-test$Forward
+  ## Train model on training set
+  fit<-glm(Forward~G + Points + EVO_GAR + EVD_GAR + SHD_GAR + Take_GAR + Draw_GAR + Off_GAR + Def_GAR + Pens_GAR + GAR,data=train,family="binomial")
+  probs<-predict(fit,newdata = test,type="response")
+  
+    ## Test model on test set (save all k results)
+  diags<-rbind(diags,class_diag(probs,truth, positive=1))
+
+}
+
+summarize_all(diags,mean)
+```
+
+The AUC when doing just the linear regression model was 0.9058, which is in the range for "great", in terms of how well the model is doing (the range for great is 0.9-1.0 for AUC). The AUC when doing cross validation fell slightly, and fell under the threshold for "great" to "good". This also means that there is overfitting, as the AUC went down.
+
+### Non-Parametric Classifier
+
+```{R}
+library(caret)
+fit <- train(Forward ~ G + Points + EVO_GAR + EVD_GAR + SHD_GAR + Take_GAR + Draw_GAR + Off_GAR + Def_GAR + Pens_GAR + GAR , data=num_data, method="rpart")
+library(rpart.plot)
+rpart.plot(fit$finalModel,digits=4)
+
+```
+
+```{R}
+set.seed(1234)
+cv <- trainControl(method="cv", number = 10, classProbs = T, savePredictions = T)
+fit <- train(Forward ~ G + Points + EVO_GAR + EVD_GAR + SHD_GAR + Take_GAR + Draw_GAR + Off_GAR + Def_GAR + Pens_GAR + GAR, data=num_data, trControl=cv, method="rpart")
+
+head(fit)
+
+class_diag(fit$pred$pred, fit$pred$obs, positive=1)
+```
+Interpretation of the classification tree: 
+The classification tree picked G (goals) as the variable to split on. Initially, 66.11% of the players are forwards. It then splits by whether a player scored less than 6 goals. If a player scored more than 6 goals, there is a 94.15% chance the player is a forward. If a player scored less than 6 goals, it then splits to see whether a player scored less than 2 goals. If they scored less than 2 goals, there is an 11.29% chance the player is a forward. If the player scored between 2-6 goals, there is a 55.23% chance that player is a forward.
+
+When running cross-validation on this data, the AUC was 0.7332. This means the model performed poorly.
+
+
+### Regression/Numeric Prediction
+
+```{R}
+fit<-lm(GAR~ G + Points,data=num_data)
+yhat<-predict(fit)
+
+mean((num_data$GAR-yhat)^2)
+
+class_diag(score,num_data$Forward,positive=1)
+```
+
+```{R}
+set.seed(1234)
+k=10 #choose number of folds
+data<-num_data[sample(nrow(num_data)),] #randomly order rows
+folds<-cut(seq(1:nrow(num_data)),breaks=k,labels=F) #create folds
+diags<-NULL
+for(i in 1:k){
+  train<-data[folds!=i,]
+  test<-data[folds==i,]
+  ## Fit linear regression model to training set
+  fit<-lm(GAR~G + Points,data=train)
+  ## Get predictions/y-hats on test set (fold i)
+  yhat<-predict(fit,newdata=test)
+  ## Compute prediction error  (MSE) for fold i
+  diags<-mean((test$GAR-yhat)^2) 
+}
+mean(diags)
+```
+
+When running a linear regression model, the MSE for the entire dataset was 11.84, which was high. This means the model does not fit well. When cross validation was run on the model, the MSE was 16.44, which means that there was a sign of overfitting.
+
+### Python 
+
+```{R}
+library(reticulate)
+```
+
+```{python}
+#favplayer = "Auston Matthews"
+```
+
+```{r}
+#print("My favorite player is ",py$favplayer)
+```
+
+I don't know why it's not working so I commented it out (it keeps freezing and nothing happens), but the code is supposed to print "My favorite player is Auston Matthews" by referring to the favplayer variable. The favplayer variable is a python variable, which I call using py$favplayer, and print it in a chunk of R code.
+
+### Concluding Remarks
+
+
+
+
